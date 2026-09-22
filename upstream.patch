@@ -1,0 +1,658 @@
+diff --git a/eval_layercast.py b/eval_layercast.py
+index 2bde219..54ec7d4 100755
+--- a/eval_layercast.py
++++ b/eval_layercast.py
+@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Tuple, Optional
+ from tqdm import tqdm
+ from evals.tasks import TASK_HANDLER_MAP, TASK_NAMES_TO_YAML, TaskConfig, TaskHandler
+ from evals.util.results import SummaryResults, save_summary
+-
+ from vllm.entrypoints.chat_utils import (apply_hf_chat_template,
+                                          parse_chat_messages,)
+ from vllm.utils import is_list_of
+@@ -20,21 +19,26 @@ from vllm.inputs import TextPrompt, TokensPrompt
+ from prompt_util.prompt_template import make_conversation_from_contents
+ from evals.tasks import TASK_HANDLER_MAP, TASK_NAMES_TO_YAML, TaskConfig
+ 
+-from patch_vllm import patch_qwen2_vllm, patch_llama_vllm
++from patch_vllm import (patch_qwen2_vllm, patch_llama_vllm,
++                        patch_qwen3_vllm)
+ patch_qwen2_vllm()
+ patch_llama_vllm()
++patch_qwen3_vllm()
++
++PINNED_DATE_STRING = os.environ.get("RF_DATE_STRING", "26 Jul 2024")
++CHAT_TEMPLATE_KWARGS = {"date_string": PINNED_DATE_STRING}
+ 
+ logger = logging.getLogger(__name__)
+ 
+ TASK_MAX_IDX = {
+     'aime24': 29,
++    'gpqa_diamond': 197,
+     'math500': 499,
+     'livecodebench_easy': 181,
+     'livecodebench_medium': 205,
+     'livecodebench_hard': 122,
+ }
+ 
+-# Add argument parser
+ def parse_args():
+     parser = argparse.ArgumentParser(description='Run model inference with configurable parameters')
+     parser.add_argument('--model', type=str, default='deepseek-ai/DeepSeek-R1-Distill-Llama-8B',
+@@ -49,6 +53,8 @@ def parse_args():
+                       help='Batch size for inference')
+     parser.add_argument('--max_tokens', type=int, default=32768,
+                       help='Maximum number of tokens to generate')
++    parser.add_argument('--max_model_len', type=int, default=4096,
++                      help='Maximum model (context) length for the vLLM engine')
+     parser.add_argument('--exp_name', type=str, default='baseline',
+                       help='Experiment name')
+     return parser.parse_args()
+@@ -63,33 +69,29 @@ def set_seed(seed):
+     torch.backends.cudnn.benchmark = False
+ 
+ 
+-# Determine the starting point based on existing .pt files
++
+ def get_resume_point(output_path, batch_size, task):
+-    # Find all .pt files in the output directory
+     pt_files = glob.glob(f'{output_path}/problem_*_token_ids_*.pt')
+     if not pt_files:
+-        return 0  # No files exist, start from the beginning
++        return 0
+ 
+-    # Extract global_idx from filenames
+     global_indices = []
+     for pt_file in pt_files:
+-        # Filename format: problem_<global_idx>_token_ids_*.pt
+         parts = os.path.basename(pt_file).split('_')
+         try:
+-            global_idx = int(parts[1])  # Extract the global_idx
++            global_idx = int(parts[1])
+             global_indices.append(global_idx)
+         except (IndexError, ValueError):
+             continue
+ 
+     if not global_indices:
+-        return 0  # No valid indices found, start from the beginning
++        return 0
+ 
+-    # Find the largest global_idx and calculate the starting batch
+     max_global_idx = max(global_indices)
+     resume_point = ((max_global_idx + 1) // batch_size) * batch_size
+     
+     if task in TASK_MAX_IDX and max_global_idx == TASK_MAX_IDX[task]:
+-        exit(0)  # All samples have been processed, exit
++        exit(0)
+     
+     print(f"Resuming from batch starting at index {resume_point} (max_global_idx={max_global_idx})")
+     return resume_point
+@@ -108,7 +110,6 @@ def score_responses(
+     id_to_scores = {}
+ 
+     for result in tqdm(list_of_results, desc="Scoring responses"):
+-        # Get content from the result
+         model_response = result['model_answer']
+         problem_id = result['problem_id']
+         problem = eval_data[problem_id]
+@@ -131,7 +132,6 @@ def score_responses(
+ if __name__ == '__main__':
+     args = parse_args()
+     set_seed(args.seed)
+-    # Create outputs directory if it doesn't exist
+     output_path = f'./outputs/vllm_layercast/{args.exp_name}/{args.model}'
+     os.makedirs(output_path, exist_ok=True)
+     
+@@ -141,30 +141,27 @@ if __name__ == '__main__':
+     handler_name = task_config.handler
+     handler_cls = TASK_HANDLER_MAP[handler_name]
+     handler = handler_cls(task_config)
+-    eval_data = handler.load_and_filter_dataset(0, -1) # start from 0, load all
++    eval_data = handler.load_and_filter_dataset(0, -1)
+     remaining_data = handler.process_remaining_data(eval_data, {})
+     conversations = handler.make_conversations(
+         remaining_data,
+-        None, # str(model_config.system_prompt),
+-        None, # model_config.user_template,
+-        None, # model_config.assistant_prefill,
++        None,
++        None,
++        None,
+     )
+     total_samples = len(conversations)
+     print(f"Total samples in the dataset: {total_samples}")
+ 
+-    # Get number of available GPUs
+     num_gpus = torch.cuda.device_count()
+     print(f"Using {num_gpus} GPUs for tensor parallelism")
+     
+-    model = vllm.LLM(model=args.model, 
++    model = vllm.LLM(model=args.model,
+                     tensor_parallel_size=num_gpus,
+-                    # max_model_len=length_used,
++                    max_model_len=args.max_model_len,
+                     dtype=args.dtype,
+                     enforce_eager=True)
+-    # Configure sampling parameters to return logits
+     sampling_params = SamplingParams(temperature=0.0, logprobs=5, max_tokens=args.max_tokens, seed=args.seed)
+ 
+-    # Process in batches
+     qa_pairs = []
+     jsonl_path = f'{output_path}/qa_pairs_{args.dtype}_bs_{args.batch_size}.jsonl'
+     
+@@ -180,9 +177,6 @@ if __name__ == '__main__':
+         prompts = []
+ 
+         for msgs in current_batch:
+-            # NOTE: _parse_chat_message_content_parts() currently doesn't
+-            # handle mm_processor_kwargs, since there is no implementation in
+-            # the chat message parsing for it.
+             conversation, mm_data = parse_chat_messages(
+                 msgs,
+                 model_config,
+@@ -197,6 +191,7 @@ if __name__ == '__main__':
+                 add_generation_prompt=True,
+                 continue_final_message=False,
+                 tools=None,
++                **CHAT_TEMPLATE_KWARGS,
+             )
+ 
+             if is_list_of(prompt_data, int):
+@@ -209,19 +204,17 @@ if __name__ == '__main__':
+ 
+             prompts.append(prompt)
+         
+-        # Generate with logits for current batch
+         response = model.generate(prompts, sampling_params=sampling_params)
+-        # Extract output text and logits for each sample in the batch
+         qa_pairs = []
+         for idx, output in enumerate(response):
+             global_idx = batch_start + idx
+             generated_text = output.outputs[0].text
+             token_logprobs = output.outputs[0].logprobs
+-            # Create tensors from token_logprobs
++
+             num_tokens = len(token_logprobs)
+             token_ids = torch.zeros((num_tokens, 5), dtype=torch.long)
+             logprobs = torch.zeros((num_tokens, 5), dtype=torch.float32)
+-            # Save QA pair to JSONL file
++
+             qa_pair = {
+                 "problem_id": global_idx,
+                 "question": current_batch[idx],
+@@ -229,7 +222,7 @@ if __name__ == '__main__':
+             }
+ 
+             for i, logprobs_dict in enumerate(token_logprobs):
+-                # Extract token IDs in order of rank
++
+                 sorted_items = sorted(logprobs_dict.items(), key=lambda x: x[1].rank)
+                 for j, (token_id, L) in enumerate(sorted_items):
+                     token_ids[i, j] = token_id
+@@ -253,19 +246,19 @@ if __name__ == '__main__':
+         
+     print(f"Valid response file: {responses_path}")
+     
+-    # Read the .jsonl file line by line and parse each line as a JSON object
++
+     with open(responses_path, "r") as f:
+         list_of_results = [json.loads(line) for line in f]
+     
+-    # Check if the response file is a list of dictionaries
++
+     if not all(isinstance(result, dict) for result in list_of_results):
+         raise ValueError(f"Response file does not contain valid dictionaries on each line: {responses_path}")
+     
+-    # Check if the response file is a list of dictionaries
++
+     if not isinstance(list_of_results, list):
+         raise ValueError(f"Response file is not a list of dictionaries: {responses_path}")
+     
+-    # Obtain the correct task handler
++
+     task = args.task
+     if task not in TASK_NAMES_TO_YAML:
+         raise ValueError(
+@@ -276,7 +269,7 @@ if __name__ == '__main__':
+     handler_cls = TASK_HANDLER_MAP[handler_name]
+     handler = handler_cls(task_config)
+     
+-    raw_dataset = handler.load_and_filter_dataset(0, -1) # start from 0, load all
++    raw_dataset = handler.load_and_filter_dataset(0, -1)
+     eval_data = [
+         row.to_dict()
+         for _, row in raw_dataset.iterrows()
+@@ -291,7 +284,6 @@ if __name__ == '__main__':
+         accuracy=accuracy,
+     )
+     
+-    # Create outputs directory if it doesn't exist
+     acc_path = f'./scoring_results/greedy_layercast'
+     os.makedirs(acc_path, exist_ok=True)
+     
+diff --git a/eval_main.py b/eval_main.py
+index f4eda58..8d23c0d 100755
+--- a/eval_main.py
++++ b/eval_main.py
+@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Tuple, Optional
+ from tqdm import tqdm
+ from evals.tasks import TASK_HANDLER_MAP, TASK_NAMES_TO_YAML, TaskConfig, TaskHandler
+ from evals.util.results import SummaryResults, save_summary
+-
+ from vllm.entrypoints.chat_utils import (apply_hf_chat_template,
+                                          parse_chat_messages,)
+ from vllm.utils import is_list_of
+@@ -20,8 +19,21 @@ from vllm.inputs import TextPrompt, TokensPrompt
+ from prompt_util.prompt_template import make_conversation_from_contents
+ from evals.tasks import TASK_HANDLER_MAP, TASK_NAMES_TO_YAML, TaskConfig
+ 
++PINNED_DATE_STRING = os.environ.get("RF_DATE_STRING", "26 Jul 2024")
++CHAT_TEMPLATE_KWARGS = {"date_string": PINNED_DATE_STRING}
++
+ logger = logging.getLogger(__name__)
+ 
++TASK_MAX_IDX = {
++    'aime24': 29,
++    'gpqa_diamond': 197,
++    'gsm8k': 1318,
++    'math500': 499,
++    'livecodebench_easy': 181,
++    'livecodebench_medium': 205,
++    'livecodebench_hard': 122,
++}
++
+ # Add argument parser
+ def parse_args():
+     parser = argparse.ArgumentParser(description='Run model inference with configurable parameters')
+@@ -37,8 +49,15 @@ def parse_args():
+                       help='Batch size for inference')
+     parser.add_argument('--max_tokens', type=int, default=32768,
+                       help='Maximum number of tokens to generate')
++    parser.add_argument('--max_model_len', type=int, default=4096,
++                      help='Maximum model (context) length for the vLLM engine')
+     parser.add_argument('--exp_name', type=str, default='baseline',
+                       help='Experiment name')
++    parser.add_argument('--no_resume', action='store_true',
++                      help='Ignore and overwrite any existing outputs for this '
++                           'exp_name and regenerate the full workload from '
++                           'scratch. Use this for TIMING runs so the measured '
++                           'time reflects the whole dataset, not a resumed tail.')
+     return parser.parse_args()
+    
+ 
+@@ -52,7 +71,7 @@ def set_seed(seed):
+ 
+ 
+ # Determine the starting point based on existing .pt files
+-def get_resume_point(output_path, batch_size):
++def get_resume_point(output_path, batch_size, task):
+     # Find all .pt files in the output directory
+     pt_files = glob.glob(f'{output_path}/problem_*_token_ids_*.pt')
+     if not pt_files:
+@@ -75,6 +94,10 @@ def get_resume_point(output_path, batch_size):
+     # Find the largest global_idx and calculate the starting batch
+     max_global_idx = max(global_indices)
+     resume_point = ((max_global_idx + 1) // batch_size) * batch_size
++
++    if task in TASK_MAX_IDX and max_global_idx == TASK_MAX_IDX[task]:
++        exit(0)  # All samples already processed; exit before loading the model
++
+     print(f"Resuming from batch starting at index {resume_point} (max_global_idx={max_global_idx})")
+     return resume_point
+ 
+@@ -134,13 +157,31 @@ if __name__ == '__main__':
+     total_samples = len(conversations)
+     print(f"Total samples in the dataset: {total_samples}")
+ 
++    jsonl_path = f'{output_path}/qa_pairs_{args.dtype}_bs_{args.batch_size}.jsonl'
++
++    if args.no_resume:
++        # Fresh full run (timing): remove any prior outputs for this config so
++        # nothing is skipped and the appended jsonl doesn't accumulate.
++        stale = glob.glob(f'{output_path}/problem_*.pt')
++        for f in stale:
++            os.remove(f)
++        if os.path.exists(jsonl_path):
++            os.remove(jsonl_path)
++        if stale:
++            print(f"--no_resume: cleared {len(stale)} stale output files")
++        start_point = 0
++    else:
++        # Resume BEFORE loading the model, so a finished/duplicate run exits
++        # (via get_resume_point's early exit) without paying the load cost.
++        start_point = get_resume_point(output_path, args.batch_size, args.task)
++
+     # Get number of available GPUs
+     num_gpus = torch.cuda.device_count()
+     print(f"Using {num_gpus} GPUs for tensor parallelism")
+-    
+-    model = vllm.LLM(model=args.model, 
++
++    model = vllm.LLM(model=args.model,
+                     tensor_parallel_size=num_gpus,
+-                    # max_model_len=length_used,
++                    max_model_len=args.max_model_len,
+                     dtype=args.dtype,
+                     enforce_eager=True)
+     # Configure sampling parameters to return logits
+@@ -148,10 +189,7 @@ if __name__ == '__main__':
+ 
+     # Process in batches
+     qa_pairs = []
+-    jsonl_path = f'{output_path}/qa_pairs_{args.dtype}_bs_{args.batch_size}.jsonl'
+-    
+-    start_point = get_resume_point(output_path, args.batch_size)
+-    
++
+     for batch_start in range(start_point, total_samples, args.batch_size):
+         batch_end = min(batch_start + args.batch_size, total_samples)
+         current_batch = conversations[batch_start:batch_end]
+@@ -179,6 +217,7 @@ if __name__ == '__main__':
+                 add_generation_prompt=True,
+                 continue_final_message=False,
+                 tools=None,
++                **CHAT_TEMPLATE_KWARGS,
+             )
+ 
+             if is_list_of(prompt_data, int):
+diff --git a/evals/tasks/gpqa_diamond/gpqa_diamond_handler.py b/evals/tasks/gpqa_diamond/gpqa_diamond_handler.py
+index f0bcc2b..2230835 100644
+--- a/evals/tasks/gpqa_diamond/gpqa_diamond_handler.py
++++ b/evals/tasks/gpqa_diamond/gpqa_diamond_handler.py
+@@ -1,3 +1,4 @@
++import hashlib
+ import random
+ 
+ from ...util.math_parsing_util import get_multiple_choice_answer
+@@ -7,9 +8,48 @@ from ..base import TaskHandler
+ 
+ class GPQADiamondTaskHandler(TaskHandler):
+ 
++    def _deterministic_choice_mapping(self, problem):
++        """Return (multiple_choice_string, correct_answer_letter) for `problem`.
++
++        The four options are shuffled with an RNG seeded by a stable hash of
++        the question text. This makes the letter ordering shown to the model
++        identical on every run (reproducibility), and — crucially — lets
++        scoring reconstruct the exact same mapping without depending on any
++        state set during prompt generation. (The eval scripts reload the raw
++        dataset for scoring, which has no "Answer" column, so the previous
++        code raised KeyError: 'Answer'.) A local `random.Random` is used so
++        the global RNG is left untouched. `hashlib` is used rather than the
++        builtin `hash()` because the latter is salted per process
++        (PYTHONHASHSEED) and would not be stable across runs.
++        """
++        answers = [
++            problem["Correct Answer"],
++            problem["Incorrect Answer 1"],
++            problem["Incorrect Answer 2"],
++            problem["Incorrect Answer 3"],
++        ]
++        seed = int(
++            hashlib.md5(str(problem["Question"]).encode("utf-8")).hexdigest(), 16
++        )
++        random.Random(seed).shuffle(answers)
++
++        options = ["A", "B", "C", "D"]
++        options_to_answers = {
++            letter: answer for letter, answer in zip(options, answers)
++        }
++        multiple_choice_string = ", ".join(
++            f"{letter}) {options_to_answers[letter]}" for letter in options
++        )
++        correct_answer_letter = next(
++            letter
++            for letter, answer in options_to_answers.items()
++            if answer == problem["Correct Answer"]
++        )
++        return multiple_choice_string, correct_answer_letter
++
+     def generate_prompt(self, problem):
+         multiple_choice_string, correct_answer_letter = (
+-            self.get_multiple_choice_answers(problem)
++            self._deterministic_choice_mapping(problem)
+         )
+         problem["Answer"] = correct_answer_letter
+         problem["prompt"] = problem["Question"] + "\n" + multiple_choice_string
+@@ -36,37 +76,18 @@ class GPQADiamondTaskHandler(TaskHandler):
+ 
+     def check_correctness(self, problem, generation):
+         pred = get_multiple_choice_answer(generation)
+-        answer = problem[self.task_config.answer_key]
++        # At scoring time the dataset is reloaded fresh, so `problem` has no
++        # pre-set answer letter; reconstruct it deterministically from the raw
++        # option fields (same mapping the model was shown).
++        answer = problem.get(self.task_config.answer_key)
++        if answer is None:
++            _, answer = self._deterministic_choice_mapping(problem)
+         return answer == pred
+ 
+     def get_multiple_choice_answers(self, data):
+-        answers = [
+-            data["Correct Answer"],
+-            data["Incorrect Answer 1"],
+-            data["Incorrect Answer 2"],
+-            data["Incorrect Answer 3"],
+-        ]
+-        random.shuffle(answers)
+-
+-        # Map options to letters
+-        options = ["A", "B", "C", "D"]
+-        options_to_answers = {
+-            letter: answer for letter, answer in zip(options, answers)
+-        }
+-
+-        # Format the options into the string
+-        multiple_choice_string = ", ".join(
+-            f"{letter}) {options_to_answers[letter]}" for letter in options
+-        )
+-
+-        # Save the letter corresponding to the correct answer
+-        correct_answer_letter = next(
+-            letter
+-            for letter, answer in options_to_answers.items()
+-            if answer == data["Correct Answer"]
+-        )
+-
+-        return multiple_choice_string, correct_answer_letter
++        # Kept for backwards compatibility; delegates to the deterministic
++        # mapping so any external caller sees the same ordering.
++        return self._deterministic_choice_mapping(data)
+ 
+     def load_and_filter_dataset(
+         self, start, end, split=None, subset=None, difficulty=None
+diff --git a/evals/tasks/gsm8k/gsm8k.yaml b/evals/tasks/gsm8k/gsm8k.yaml
+index 58159f9..5d114be 100644
+--- a/evals/tasks/gsm8k/gsm8k.yaml
++++ b/evals/tasks/gsm8k/gsm8k.yaml
+@@ -5,5 +5,5 @@ dataset_split: test
+ question_key: question
+ answer_key: answer
+ templating_parameters:
+-  template: "Given the following problem, reason and give a final answer to the problem.\nProblem: {question}\nYour response should end with \"The final answer is [answer]\" where [answer] is the response to the problem."
++  template: "Solve the grade-school math problem. Conclude with the final number clearly.\n\n{question}\n\nFinish with \\boxed{{...}} or 'Answer: ...'."
+ 
+diff --git a/evals/tasks/math/math500.yaml b/evals/tasks/math/math500.yaml
+index 36c83ee..3ec4175 100644
+--- a/evals/tasks/math/math500.yaml
++++ b/evals/tasks/math/math500.yaml
+@@ -4,8 +4,8 @@ dataset_subset: null # which subset on huggingface
+ question_key: problem
+ answer_key: answer
+ dataset_split: test
+-templating_parameters: 
+-  template: "Return your final response within \\boxed{{}}. {problem}"
++templating_parameters:
++  template: "Solve the problem and give the final answer clearly.\n\n{problem}\n\nFinish with \\boxed{{...}} or a line like 'Answer: ...'."
+ # optional. Not supported yet. 
+ # fewshot_config:
+ #   - question: ...
+diff --git a/evals/util/math_parsing_util.py b/evals/util/math_parsing_util.py
+index 9c194c5..78dac39 100644
+--- a/evals/util/math_parsing_util.py
++++ b/evals/util/math_parsing_util.py
+@@ -271,6 +271,14 @@ def extract_answer(pred_str, use_last_number=True):
+         else:
+             a = ans.split("$")[0].strip()
+         pred = a
++    elif re.search(r"answer\s*:", pred_str, re.IGNORECASE):
++        # Capture text after the LAST "Answer:" up to end of line.
++        matches = list(
++            re.finditer(r"answer\s*:\s*([^\n]+)", pred_str, re.IGNORECASE)
++        )
++        pred = matches[-1].group(1).strip() if matches else ""
++        # Strip surrounding markdown emphasis like **...** or *...*.
++        pred = re.sub(r"^\*+|\*+$", "", pred).strip()
+     elif "he answer is" in pred_str:
+         pred = pred_str.split("he answer is")[-1].strip()
+     elif "final answer is" in pred_str:
+diff --git a/patch_vllm.py b/patch_vllm.py
+index 84132d5..e61347c 100644
+--- a/patch_vllm.py
++++ b/patch_vllm.py
+@@ -12,7 +12,8 @@ from vllm.worker.cache_engine import CacheEngine
+ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
+                         get_dtype_size, is_pin_memory_available)
+ from vllm.distributed import get_pp_group
+-from vllm.model_executor.models.qwen2 import Qwen2Model, LogitsProcessor, get_sampler, ParallelLMHead, PPMissingLayer, maybe_prefix
++from vllm.model_executor.models.qwen2 import Qwen2Model, LogitsProcessor, ParallelLMHead, PPMissingLayer, maybe_prefix
++from vllm.model_executor.layers.sampler import get_sampler
+ from vllm.model_executor.models.llama import LlamaModel, LlamaForCausalLM, LlamaAttention
+ 
+ from vllm.attention import Attention
+@@ -89,13 +90,32 @@ def our_fp32_rope_forward_cuda(
+     return query, key
+     
+ 
++# Set RF_FUSED=0 to fall back to the original LayerCast path for A/B
++import os as _os
++RF_FUSED = _os.environ.get("RF_FUSED", "1") == "1"
++# Store the lm_head in bf16 as well (untied models only)
++RF_BF16_LMHEAD = _os.environ.get("RF_BF16_LMHEAD", "1") == "1"
++if RF_FUSED:
++    from rf_kernels import rf_linear
++
++
++def rf_maybe_downcast_lm_head(lm_head, config):
++    if (RF_FUSED and RF_BF16_LMHEAD
++            and not config.tie_word_embeddings
++            and isinstance(lm_head, torch.nn.Module)
++            and hasattr(lm_head, "weight")):
++        lm_head.weight.data = lm_head.weight.data.to(torch.bfloat16)
++
++
+ def our_linear_apply(self,
+             layer: torch.nn.Module,
+             x: torch.Tensor,
+             bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+     # x is already in fp32
+     assert x.dtype == torch.float32
+-    # Upcast weights to fp32 for computation
++    if RF_FUSED:
++        return rf_linear(x, layer.weight, bias)
++    # Original LayerCast path: upcast weights to fp32 for computation
+     weight = layer.weight.to(torch.float32)
+     if bias is not None:
+         bias = bias.to(torch.float32)
+@@ -210,6 +230,7 @@ def patch_qwen2_vllm():
+         convert_linear_weights_to_bfloat16(self.model)
+         if not isinstance(self.lm_head, PPMissingLayer):
+             convert_linear_weights_to_bfloat16(self.lm_head)
++            rf_maybe_downcast_lm_head(self.lm_head, config)
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size, scale=1.2)
+         self.sampler = get_sampler()
+@@ -238,7 +259,6 @@ def patch_qwen2_vllm():
+     UnquantizedEmbeddingMethod.apply = our_linear_apply
+     RotaryEmbedding.forward_cuda = our_fp32_rope_forward_cuda
+     Qwen2Attention.forward = our_attn_forward
+-    print("Patched vLLM for Qwen2: Model loaded in fp32, linear weights stored in bfloat16, all computations in fp32")
+ 
+ 
+ def patch_llama_vllm():
+@@ -280,6 +300,7 @@ def patch_llama_vllm():
+         convert_linear_weights_to_bfloat16(self.model)
+         if not isinstance(self.lm_head, PPMissingLayer):
+             convert_linear_weights_to_bfloat16(self.lm_head)
++            rf_maybe_downcast_lm_head(self.lm_head, config)
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size, scale=1.2)
+         self.sampler = get_sampler()
+@@ -296,7 +317,7 @@ def patch_llama_vllm():
+         self.rotary_emb = get_rope(
+             self.head_dim,
+             rotary_dim=self.head_dim,
+-            max_position=kwargs['max_position'],
++            max_position=kwargs['max_position_embeddings'],
+             base=self.rope_theta,
+             rope_scaling=kwargs['rope_scaling'],
+             dtype=torch.float32  # RoPE computation in fp32
+@@ -308,4 +329,67 @@ def patch_llama_vllm():
+     UnquantizedEmbeddingMethod.apply = our_linear_apply
+     RotaryEmbedding.forward_cuda = our_fp32_rope_forward_cuda
+     LlamaAttention.forward = our_attn_forward
+-    print("Patched vLLM for Llama: Model loaded in fp32, linear weights stored in bfloat16, all computations in fp32")
++
++
++def patch_qwen3_vllm():
++    import os
++    os.environ["VLLM_ATTENTION_BACKEND"] = "XFORMERS"
++    from vllm.model_executor.models.qwen3 import (Qwen3Attention,
++                                                  Qwen3ForCausalLM,
++                                                  Qwen3Model)
++
++    patch_cache_engine()
++
++    def new_qwen3_lm_init(self, *, vllm_config, prefix: str = ""):
++        torch.nn.Module.__init__(self)
++        config = vllm_config.model_config.hf_config
++        quant_config = vllm_config.quant_config
++        lora_config = vllm_config.lora_config
++
++        self.config = config
++        self.lora_config = lora_config
++        self.quant_config = quant_config
++
++        self.model = Qwen3Model(vllm_config=vllm_config,
++                                prefix=maybe_prefix(prefix, "model"))
++
++        if get_pp_group().is_last_rank:
++            if config.tie_word_embeddings:
++                self.lm_head = self.model.embed_tokens
++            else:
++                self.lm_head = ParallelLMHead(config.vocab_size,
++                                              config.hidden_size,
++                                              quant_config=quant_config,
++                                              prefix=maybe_prefix(
++                                                  prefix, "lm_head"))
++        else:
++            self.lm_head = PPMissingLayer()
++
++        convert_linear_weights_to_bfloat16(self.model)
++        if not isinstance(self.lm_head, PPMissingLayer):
++            convert_linear_weights_to_bfloat16(self.lm_head)
++            rf_maybe_downcast_lm_head(self.lm_head, config)
++
++        self.logits_processor = LogitsProcessor(config.vocab_size, scale=1.2)
++        self.sampler = get_sampler()
++        self.make_empty_intermediate_tensors = (
++            self.model.make_empty_intermediate_tensors)
++
++    Qwen3ForCausalLM.__init__ = new_qwen3_lm_init
++
++    original_init = Qwen3Attention.__init__
++    def new_qwen3_init(self, *args, **kwargs):
++        original_init(self, *args, **kwargs)
++        self.rotary_emb = get_rope(
++            self.head_dim,
++            rotary_dim=self.head_dim,
++            max_position=kwargs['max_position'],
++            base=self.rope_theta,
++            rope_scaling=kwargs['rope_scaling'],
++            dtype=torch.float32
++        )
++
++    Qwen3Attention.__init__ = new_qwen3_init
++    UnquantizedLinearMethod.apply = our_linear_apply
++    UnquantizedEmbeddingMethod.apply = our_linear_apply
++    RotaryEmbedding.forward_cuda = our_fp32_rope_forward_cuda

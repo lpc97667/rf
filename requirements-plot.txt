@@ -1,0 +1,5 @@
+# Environment used for plots
+
+matplotlib==3.10.8
+pandas==3.0.1
+numpy==2.4.3

@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+/evals/
+/prompt_util/
+/eval_main.py
+/eval_layercast.py
+/patch_vllm.py
+
+outputs/
+scoring_results/
